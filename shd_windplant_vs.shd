@@ -1,0 +1,667 @@
+//=============================================================================
+// SHD_WINDPLANT_VS.SHD
+// Wind-animated vertex shader for 3D-mesh plants and plant parts (bushes,
+// shrubs, reeds, modeled flowers). Override of vslit_nm.shd,
+//
+// Overridden stock functions (diff against referenceshaders/ on vendor sync):
+//   TransformMainCoordinatesOverride() <- inc_transform::TransformMainCoordinates()
+//   ApplyStandardShaderOverride()      <- inc_standard::ApplyStandardShader()
+//
+// Custom sections in this file (grep "CUSTOM SECTION"):
+//   CUSTOM SECTION: Plant wind animation
+//     Global-wind sway + mesh-thickness-driven bend profile + local-wind-
+//     source response with source-in-bbox damping + min-standing-angle
+//     tilt clamp. Inserted between the skinmesh block and the projection /
+//     tangent setup code that we kept verbatim from the stock shader.
+//
+// Varyings to shd_windplant_fs.shd:
+//   vPlantHeight    float   0 at base, 1 at tip
+//   vWindIntensity  float   0 still,   1 max bend
+//
+// On magic numbers in this file:
+// This shader went through many iterations of visual tuning. Sway strength
+// and sway speed arrive as material parameters (fSwayStrength, fSwaySpeed
+// uniforms) and are denormalized here with fixed legacy scale factors; the
+// rest of the in-file constants (phase coefficients, zone ratios, Z-
+// compensation factor, area-wind defaults, mesh-thickness smoothstep
+// breakpoints, etc.) are equally load-bearing. Hundreds of meshes and
+// materials are authored against these exact values - a refactor of any
+// of them is a content-side migration affecting the whole game, not a
+// shader-side change.
+//=============================================================================
+
+#define SHADER_TYPE 1
+
+#define FOG 1
+#define KEYHOLING 1
+
+#define NORMAL_MAP 1
+#define LIGHTING 1
+
+#include "inc_standard"
+
+uniform mat4 m_m;
+uniform float fSwaySpeed;
+uniform float fSwayStrength;
+uniform float fTilesetMeshOffsetZ;
+
+uniform sampler2D texUnit6;
+
+// Pass wind and height data to fragment shader
+out float vPlantHeight;        // 0 at base, 1 at tip
+out float vWindIntensity;      // 0 = still, 1 = max bend
+
+// From ovr\"inc_transform" => TransformMainCoordinates() 
+void TransformMainCoordinatesOverride()
+{
+	vec4 vLocalPosition = vec4(0.0, 0.0, 0.0, 0.0);
+
+	#if NORMAL_MAP == 1
+		vVertexTangent = vec3(0.0, 0.0, 0.0);
+	#endif
+	#if VERTEX_NORMAL == 1
+		vVertexNormal = vec3(0.0, 0.0, 0.0);
+	#endif
+	if(skinmesh == 1)
+	{
+		int index = 0;
+		
+		if(vWeight.x > 0.0)
+		{
+			index = int(vIndex.x);
+			vLocalPosition = SkinmeshTransformPosition(vPos, index) * vWeight.x;
+			#if NORMAL_MAP == 1
+				vVertexTangent = SkinmeshTransformOrientation(vTangent, index) * vWeight.x;
+			#endif
+			#if VERTEX_NORMAL == 1
+				vVertexNormal = SkinmeshTransformOrientation(vNormal, index) * vWeight.x;
+			#endif
+		}
+		if(vWeight.y > 0.0)
+		{
+			index = int(vIndex.y);
+			vLocalPosition += SkinmeshTransformPosition(vPos, index) * vWeight.y;
+			#if NORMAL_MAP == 1
+				vVertexTangent = SkinmeshTransformOrientation(vTangent, index) * vWeight.y + vVertexTangent;
+			#endif
+			#if VERTEX_NORMAL == 1
+				vVertexNormal = SkinmeshTransformOrientation(vNormal, index) * vWeight.y + vVertexNormal;
+			#endif
+		}
+		if(vWeight.z > 0.0)
+		{
+			index = int(vIndex.z);
+			vLocalPosition += SkinmeshTransformPosition(vPos, index) * vWeight.z;
+			#if NORMAL_MAP == 1
+				vVertexTangent = SkinmeshTransformOrientation(vTangent, index) * vWeight.z + vVertexTangent;
+			#endif
+			#if VERTEX_NORMAL == 1
+				vVertexNormal = SkinmeshTransformOrientation(vNormal, index) * vWeight.z + vVertexNormal;
+			#endif
+		}
+		if(vWeight.w > 0.0)
+		{
+			index = int(vIndex.w);
+			vLocalPosition += SkinmeshTransformPosition(vPos, index) * vWeight.w;
+			#if NORMAL_MAP == 1
+				vVertexTangent = SkinmeshTransformOrientation(vTangent, index) * vWeight.w + vVertexTangent;
+			#endif
+			#if VERTEX_NORMAL == 1
+				vVertexNormal = SkinmeshTransformOrientation(vNormal, index) * vWeight.w + vVertexNormal;
+			#endif
+		}
+	}
+	else
+	{
+		vLocalPosition = vPos;
+		#if VERTEX_NORMAL == 1
+			vVertexNormal = vNormal;
+		#endif
+		#if NORMAL_MAP == 1
+			vVertexTangent = vTangent;
+		#endif
+	}
+     
+	/////////////////////////////////////////////
+	// CUSTOM SECTION BEGIN: Plant wind animation
+	/////////////////////////////////////////////
+	
+	// Calculate base wind strength from global wind settings
+	float fAreaWind = length(areaGlobalWind.xy);
+	 
+	// Provide default wind if none set in toolset
+	if (fAreaWind < 0.01) 
+	{
+        if ( (areaFlags == 1) || (areaFlags == 3) || (areaFlags == 5) || (areaFlags == 7) )
+		{
+			fAreaWind = 0.178;  // Indoor default
+		}
+		else
+		{
+			fAreaWind = 0.356;  // Outdoor default
+		}  
+	}
+
+	// Denormalize material parameters for consistent behavior
+	// Material values use legacy scale factors for backward compatibility
+	float fSwayStrengthMult = fSwayStrength / 60.0;                  
+	float fSwaySpeedMult = fSwaySpeed * 300.0;    
+	
+	// Get world position for texture sampling
+	vec4 vWorldPos = m_m * vLocalPosition;
+
+	// Position-based variation mask for non-uniform plant movement
+	float fPositionMask = fract(vWorldPos.x * 0.13 + vWorldPos.y * 0.17); 
+	fPositionMask = 0.5 + smoothstep(0.2, 0.8, fPositionMask) * 0.5;  // Range 0.5 to 1.0
+
+	// Add spatial variation for wave propagation effect
+	float fSpatialPhase = dot(vWorldPos.xy, vec2(0.07, 0.05));
+
+	// Calculate time-based animation phase
+	float fTimePhase = worldtimerTimeOfDay / fSwaySpeedMult;
+	
+	// Sample noise texture with slow scrolling for variation
+	vec2 scrolledUV = vWorldPos.xy * 0.03 + vec2(fTimePhase * 0.0001, 0.0);
+	float fVertexNoise = texture(texUnit6, scrolledUV).r;
+
+	// Calculate height-based bending gradient
+	float fPlantHeight = max(bboxMax.z - bboxMin.z, 0.001);  // Prevent division by zero
+	float heightFromBase = vLocalPosition.z - bboxMin.z;
+	float fNormalizedHeight = clamp(heightFromBase / fPlantHeight, 0.0, 1.0);
+	
+	//-------------------------------------
+	// MESH THICKNESS DETECTION SYSTEM
+	// Automatically detect blade-like vs volumetric geometry
+	//-------------------------------------
+	
+	// Calculate mesh dimensions from bounding box
+	float fMeshWidth = max(bboxMax.x - bboxMin.x, 0.001);   // X dimension
+	float fMeshDepth = max(bboxMax.y - bboxMin.y, 0.001);   // Y dimension
+	
+	// Get the maximum horizontal dimension (footprint)
+	float fMaxHorizontalDimension = max(fMeshWidth, fMeshDepth);
+	
+	// Calculate aspect ratio: horizontal size vs vertical size
+	// Low values = thin/blade-like, High values = thick/volumetric
+	float fThicknessRatio = fMaxHorizontalDimension / fPlantHeight;
+	
+	// Convert to a 0-1 range where:
+	// 0 = perfectly blade-like (needs full length compensation)
+	// 1 = fully volumetric (needs no length compensation)
+	float fVolumetricFactor = smoothstep(0.1, 0.6, fThicknessRatio);
+	
+	// Refined calculation using average of both dimensions
+	// This better handles plants that are thin in one direction but wide in another
+	float fMinHorizontalDimension = min(fMeshWidth, fMeshDepth);
+	float fAverageThickness = (fMaxHorizontalDimension + fMinHorizontalDimension) * 0.5;
+	float fRefinedThicknessRatio = fAverageThickness / fPlantHeight;
+	float fRefinedVolumetricFactor = smoothstep(0.05, 0.5, fRefinedThicknessRatio);
+	
+	// Use refined factor for more accurate detection
+	// 0 = blade-like (grass, reeds), 1 = volumetric (bushes, shrubs)
+	float fCompensationStrength = 1.0 - fRefinedVolumetricFactor;
+
+	// Mesh center and half-extents in world XY. Used below inside the local-wind
+	// loop to damp radial-inflation warping when a wind source (e.g. the player)
+	// ends up inside the bbox of a volumetric plant. Assumes the plant sits roughly
+	// upright in the world (no heavy horizontal rotation in m_m) which holds for
+	// placeable plant meshes in practice.
+	vec2 vMeshCenterWorldXY = (m_m * vec4((bboxMin + bboxMax) * 0.5, 1.0)).xy;
+	vec2 vMeshHalfExtentsXY = vec2(fMeshWidth, fMeshDepth) * 0.5;
+
+	// Height-staggered phase for organic motion
+	float fHeightPhaseOffset = fNormalizedHeight * 1.5;
+	float fPrimaryPhase = fVertexNoise * 6.28318 + fTimePhase + fSpatialPhase + fHeightPhaseOffset;
+
+	// Primary wind force with spatial phase for wave motion
+	float fWindForce = sin(fPrimaryPhase) * fSwayStrengthMult;
+	
+	// Secondary motion at different frequency for organic movement (10% strength)
+	float fSecondaryPhase = fVertexNoise * 9.42 + fTimePhase * 1.7 + fSpatialPhase * 2.0;
+	float fSecondaryForce = sin(fSecondaryPhase) * fSwayStrengthMult * 0.1;
+	
+	// Add wind gusts for dynamic motion
+	float fGustPhase = fTimePhase * 0.3 + fSpatialPhase * 0.5;
+	float fGustIntensity = smoothstep(0.0, 1.0, sin(fGustPhase) * 0.5 + 0.5);
+	fGustIntensity *= smoothstep(0.0, 1.0, sin(fGustPhase * 3.7) * 0.5 + 0.5);
+	fWindForce *= (1.0 + fGustIntensity * 0.4);
+	
+	// Combine forces
+	float fTotalForce = (fWindForce + fSecondaryForce) * 10.0 * fPositionMask;
+
+	// Add directional variation based on noise
+	float fDirectionalBias = 1.0 + (fVertexNoise - 0.5) * 0.2;  // 0.9 to 1.1 range
+
+	// Apply directional wind based on actual wind vector
+	vec2 windDir = normalize(areaGlobalWind.xy + vec2(0.001));  // Avoid divide by zero
+	vec2 perpWind = vec2(-windDir.y, windDir.x);  // Perpendicular for sideways motion
+
+	// Calculate target displacement
+	vec2 targetDisplacement = windDir * fTotalForce * fAreaWind * fDirectionalBias;
+	targetDisplacement += perpWind * fSecondaryForce * fAreaWind * 0.3 * (2.0 - fDirectionalBias);
+
+	// Convert displacement to bending rotation to keep base fixed
+	float fBendStrength = length(targetDisplacement) / max(fPlantHeight, 0.1);  // Extra safety for division
+	vec2 bendDirection = normalize(targetDisplacement + vec2(0.001));
+
+	// Bending profile: quadratic cantilever for blade-like meshes (reeds, tall grass
+	// modeled as plant meshes), linear (small-angle rigid-tilt approximation) for
+	// volumetric 3D meshes (bushes, shrubs).
+	//
+	// Why two profiles:
+	//   Effective XY shift at a vertex = fCombinedStrength * heightFromBase * fBendProfile.
+	//   With quadratic profile (h^2 / H^2), shift scales as h^3 / H^2 - very steep,
+	//   which is the right cantilever curve for a thin blade rooted at the base but
+	//   WRONG for a 3D mesh: two connected verts at different heights (e.g. a stem
+	//   joint at h=0.5 and a leaf at h=1.0) get very different XY shifts, so the
+	//   edge between them stretches. That stretching is especially visible when a
+	//   wind source is inside the mesh (player walking through a bush) because
+	//   verts are pushed radially outward by different amounts based on Z.
+	//
+	//   Linear profile (h / H) gives shift scaling of h / H, i.e. the small-angle
+	//   approximation of rigid tilt around the base: sin(theta) * h. Every vertex
+	//   yields proportionally to its height with no extra h^2 term, so internal
+	//   edges stay closer to rest length and the mesh leans as a body rather than
+	//   tearing at the top.
+	//
+	// Blend via fCompensationStrength (1 = blade, 0 = volumetric) so the mesh-
+	// thickness detection already computed above selects the right profile per
+	// mesh. Blade behavior is byte-for-byte identical to the prior code.
+	// No new tuned magic numbers - the blend reuses the existing volumetric factor.
+	float fBendProfile_blade = fNormalizedHeight * fNormalizedHeight;
+	float fBendProfile_volumetric = fNormalizedHeight;
+	float fBendProfile = mix(fBendProfile_volumetric, fBendProfile_blade, fCompensationStrength);
+
+	// Force zero displacement at very bottom to prevent sliding.
+	// Linear profile is already 0 at h=0, but we still taper across the 0-5% band
+	// to match the prior quadratic-profile smoothing so the blended result stays
+	// well-behaved at the root for every fCompensationStrength value.
+	if (fNormalizedHeight < 0.05) {
+		fBendProfile *= fNormalizedHeight * 20.0;  // Smooth fade to zero at base
+	}
+	
+	//===========================================
+	// LOCAL WIND SOURCES
+	// Handles physics objects and player movement
+	// Supports up to 32 simultaneous wind sources
+	//===========================================
+	
+	// Process active wind point sources
+	vec2 vLocalWindDisplacement = vec2(0.0);
+	float fMaxLocalForce = 0.0;
+	float fPersistentBend = 0.0;  // Vertical compression accumulator
+	
+	for (int i = 0; i < MAX_WINDS; i++) {
+		// Early termination when we've processed all active sources
+		if (i >= windPointSourcesCount) break;
+		
+		// Skip inactive sources with single check
+		if(windPointSourcesDuration[i] <= 0.0) continue;
+		
+		// Calculate distance to wind source in world space (early culling)
+		vec3 vToSource = vWorldPos.xyz - windPointSourcesPosition[i];
+		float fDistanceSq = dot(vToSource.xy, vToSource.xy);
+		
+		// Check if within radius of influence (with buffer zone for smooth fade)
+		float fRadiusSq = windPointSourcesRadius[i] * windPointSourcesRadius[i];
+		float fExtendedRadiusSq = fRadiusSq * 2.25;  // 1.5x radius for fade zone
+		
+		// Skip this source entirely if we're outside its maximum influence range
+		if(fDistanceSq > fExtendedRadiusSq) continue;
+		
+		// Only check intensity after distance check
+		if(windPointSourcesIntensity[i] <= 0.0) continue;
+		
+		// At this point we know the source affects this vertex
+		// Only calculate sqrt when actually needed
+		float fDistance = sqrt(fDistanceSq);
+		float fBaseRadius = windPointSourcesRadius[i];
+
+		// Calculate normalized push direction (away from source)
+		vec2 pushDir = fDistance > 0.001 ? normalize(vToSource.xy) : vec2(1.0, 0.0);
+
+		// Time-based animation parameters
+		float fRelativeTime = windPointSourcesTimeRemaining[i] / max(windPointSourcesDuration[i], 0.001);
+		float fElapsedTime = windPointSourcesDuration[i] - windPointSourcesTimeRemaining[i];
+
+		// Distance-based fade for smooth edges
+		float fFadeMultiplier = 1.0;
+		if(fDistance > fBaseRadius) {
+			float fExtendedRadius = fBaseRadius * 1.5;
+			fFadeMultiplier *= smoothstep(fExtendedRadius, fBaseRadius, fDistance);
+		}
+
+		//-------------------------------------
+		// COMPRESSION ZONE (Inner 30% radius)
+		// Flattens plants directly under object
+		//-------------------------------------
+		float fCompressionRadius = fBaseRadius * 0.3;
+		float fCompressionForce = 0.0;
+
+		if(fDistance < fCompressionRadius) {
+			// Strong downward force at impact center
+			float fCompressionFactor = smoothstep(fCompressionRadius, 0.0, fDistance);
+			fCompressionForce = fCompressionFactor * windPointSourcesIntensity[i] * 2.0;
+		}
+
+		//-------------------------------------
+		// DIRECTIONAL PUSH ZONE (20-80% radius)
+		// Creates outward wave from center
+		//-------------------------------------
+		float fPushZoneInner = fBaseRadius * 0.2;
+		float fPushZoneOuter = fBaseRadius * 0.8;
+		float fDirectionalForce = 0.0;
+
+		if(fDistance > fPushZoneInner && fDistance < fPushZoneOuter) {
+			float fZoneFactor = (fDistance - fPushZoneInner) / (fPushZoneOuter - fPushZoneInner);
+			// Sinusoidal force distribution across zone
+			float fBasePush = sin(fZoneFactor * 3.14159) * windPointSourcesIntensity[i];
+
+			// Memory factor for force persistence
+			float fMemoryFactor = mix(0.5, 1.0, smoothstep(0.0, 1.0, fRelativeTime));
+
+			// Apply memory factor to base force
+			fDirectionalForce = fBasePush * fMemoryFactor;
+		}
+			
+		//-------------------------------------
+		// SMOOTH TRANSITIONS
+		// Handles fade-in, fade-out, and recovery
+		//-------------------------------------
+
+		// Calculate transition modifiers independently
+		float fFadeInMod = 1.0;
+		float fFadeOutMod = 1.0;
+		float fRecoveryMod = 1.0;
+
+		// Fade-in: First 30% of effect duration
+		float fFadeInThreshold = 0.3;
+		if (fElapsedTime < fFadeInThreshold * windPointSourcesDuration[i]) {
+			float fFadeInNorm = fElapsedTime / (fFadeInThreshold * windPointSourcesDuration[i]);
+			// Cubic ease-in-out curve
+			fFadeInMod = fFadeInNorm * fFadeInNorm * (3.0 - 2.0 * fFadeInNorm);
+		}
+
+		// Fade-out: Last 50% of effect duration
+		float fFadeOutThreshold = 0.5;
+		if (fRelativeTime < fFadeOutThreshold) {
+			float fFadeOutNorm = fRelativeTime / fFadeOutThreshold;
+			fFadeOutMod = fFadeOutNorm * fFadeOutNorm * (3.0 - 2.0 * fFadeOutNorm);
+		}
+
+		// Recovery: Cosine-based spring back starting at 0.25s
+		float fRecoveryStartDelay = 0.25;
+		if(fElapsedTime > fRecoveryStartDelay) {
+			float fRecoveryTime = fElapsedTime - fRecoveryStartDelay;
+			// Cosine interpolation for natural motion
+			float fRecoveryPhase = min(fRecoveryTime * 0.3, 3.14159);  // 0 to PI over ~10.5 seconds
+			fRecoveryMod = (cos(fRecoveryPhase) + 1.0) * 0.5;  // Smooth 1 to 0 transition
+		}
+
+		// Combine modifiers for smooth overall transition
+		float fCombinedFade = min(fFadeInMod, fFadeOutMod);  // Prevent overlapping conflicts
+		float fFinalModifier = fCombinedFade * fRecoveryMod;
+
+		// Apply final modifier to forces
+		fDirectionalForce *= fFinalModifier;
+		fCompressionForce *= fFinalModifier * 0.85;  // Compression responds more slowly
+
+		//-------------------------------------
+		// SOURCE-IN-BBOX DAMPING (volumetric meshes only)
+		// When a wind source (typically the player) ends up inside the bbox
+		// of a thick 3D mesh, per-vertex pushDir = normalize(vertex - source)
+		// points outward in all directions, so verts on opposite sides of the
+		// source get pushed in opposite directions and the mesh literally
+		// inflates. This cannot be fixed per-vertex without topology info,
+		// so we instead reduce the force magnitude whenever the source is
+		// anywhere inside the bbox, with a stronger damp at center and a
+		// still-heavy damp at the periphery.
+		//
+		// Damp profile along the bbox interior (ellipsoidal distance from
+		// center, 0 = center, 1 = bbox edge):
+		//   dist = 0   -> force * 0.00  (100% damped, fully inert at center)
+		//   dist = 0.5 -> force * 0.10  (about 90% damped midway out)
+		//   dist = 1.0 -> force * 0.20  (80% damped right at bbox edge)
+		//   dist > 1.1 -> force * 1.00  (source outside bbox, no damping)
+		//
+		// Smooth transition across the bbox boundary (0.9 - 1.1) so damping
+		// phases in as the source enters the mesh rather than snapping on.
+		// Blade-like meshes are unaffected because fRefinedVolumetricFactor
+		// near 0 leaves the damp strength near 0 regardless of position.
+		//
+		// The 0.8 periphery value is the one knob worth tuning if the damp
+		// reads as too aggressive (raise it) or not aggressive enough (lower
+		// it, toward 1.0 for uniform-across-bbox).
+		//-------------------------------------
+		vec2 vSourceOffsetNorm = (windPointSourcesPosition[i].xy - vMeshCenterWorldXY)
+		                        / max(vMeshHalfExtentsXY, vec2(0.001));
+		float fOffsetLen     = length(vSourceOffsetNorm);
+		float fInsideBbox    = 1.0 - smoothstep(0.9, 1.1, fOffsetLen);      // 1 inside, 0 outside
+		float fCenterWeight  = 1.0 - clamp(fOffsetLen, 0.0, 1.0);           // 1 at center, 0 at edge
+		// Damp strength: 0.8 at bbox edge (periphery), 1.0 at center.
+		float fDampStrength  = fInsideBbox * mix(0.8, 1.0, fCenterWeight);
+		float fInsideDamp    = 1.0 - fDampStrength * fRefinedVolumetricFactor;
+		fDirectionalForce *= fInsideDamp;
+		fCompressionForce *= fInsideDamp;
+
+		//-------------------------------------
+		// TURBULENCE ZONE (80-100% radius)
+		// Adds chaotic edge movement
+		//-------------------------------------
+		if(fDistance > fPushZoneOuter && fDistance < fBaseRadius) {
+			float fTurbulenceFactor = smoothstep(fBaseRadius, fPushZoneOuter, fDistance);
+			float fTurbulence = fVertexNoise * 0.3 * windPointSourcesIntensity[i] * fTurbulenceFactor;
+			// Perpendicular swirl component
+			vec2 perpDir = vec2(-pushDir.y, pushDir.x);
+			vLocalWindDisplacement += perpDir * fTurbulence * sin(fElapsedTime * 10.0) * fFadeMultiplier;
+		}
+
+		// Accumulate forces with distance-based fading
+		float fTotalLocalForce = (fCompressionForce + fDirectionalForce) * fFadeMultiplier;
+
+		// Apply forces based on type
+		if(fCompressionForce > 0.01) {
+			// Compression: Primarily vertical with slight horizontal component
+			vLocalWindDisplacement += pushDir * fCompressionForce * 0.3 * fFadeMultiplier;
+			// Track vertical compression
+			fPersistentBend = max(fPersistentBend, fCompressionForce * fFadeMultiplier);
+		} else {
+			// Directional: Full horizontal push
+			vLocalWindDisplacement += pushDir * fDirectionalForce * fFadeMultiplier;
+		}
+
+		fMaxLocalForce = max(fMaxLocalForce, abs(fTotalLocalForce));
+	}
+	
+	// Convert local wind to directional bending
+	vec2 localBendDirection = length(vLocalWindDisplacement) > 0.001 ? 
+	                          normalize(vLocalWindDisplacement) : vec2(0.0);
+	float fLocalBendStrength = min(length(vLocalWindDisplacement) * 0.2, 1.0);
+	
+	// Combine global and local wind displacements
+	vec2 combinedDisplacement = bendDirection * fBendStrength + localBendDirection * fLocalBendStrength;
+	float fCombinedStrength = length(combinedDisplacement);
+	vec2 finalBendDirection = fCombinedStrength > 0.001 ? 
+	                          normalize(combinedDisplacement) : bendDirection;
+
+	// Apply bending as shear transformation proportional to height
+	// Save the vertex's pre-bend XY so the tilt clamp below can measure bend displacement
+	// relative to this vertex's "rest base" (restXY, bboxMin.z).
+	vec2 vRestXY = vLocalPosition.xy;
+	vLocalPosition.xy += finalBendDirection * fCombinedStrength * heightFromBase * fBendProfile;
+
+	// Compensate Z to maintain plant element length (prevents stretching)
+	// Compensation is automatically adjusted based on detected mesh type
+	float fBendAmount = fCombinedStrength * fBendProfile;
+	vLocalPosition.z -= fBendAmount * fBendAmount * heightFromBase * 0.25 * fCompensationStrength;
+
+	// Apply vertical compression for objects pushing down
+	if (fPersistentBend > 0.01) {
+		vLocalPosition.z -= fPersistentBend * heightFromBase * fBendProfile * 0.5;
+	}
+
+	//-------------------------------------
+	// MINIMUM STANDING ANGLE CLAMP
+	// Prevents plants from going pancake-flat under foot traffic / physics objects.
+	// Caps tilt at 20 degrees from vertical (plant stays at >=70 degrees from ground plane).
+	// Tuned global-wind magnitudes never reach this angle, so authored sway is unaffected;
+	// the clamp only engages when stacked local-wind compression + directional push would
+	// otherwise drive a vertex flat. Projects the vertex onto the 20 degree cone at its
+	// rest height so the plant keeps its rest length instead of shrinking when clamped.
+	// NOTE: fMaxTiltSin / fMaxTiltCos are derived from the 70 degree floor:
+	//       fMaxTiltSin = sin(90 degrees - 70 degrees) = sin(20 degrees)
+	//       fMaxTiltCos = cos(90 degrees - 70 degrees) = cos(20 degrees)
+	// If the floor changes, update both constants in sync. These are not asset-tuning
+	// constants - they are a hard geometric ceiling independent of any sway parameter.
+	// Applied after the fCompensationStrength-scaled Z drop so volumetric meshes (bushes)
+	// and blade-like meshes (reeds) share the same final tilt ceiling.
+	//-------------------------------------
+	const float fMaxTiltSin = 0.342;   // sin(20 degrees)
+	const float fMaxTiltCos = 0.940;   // cos(20 degrees)
+	vec2  vBendXY    = vLocalPosition.xy - vRestXY;
+	float fBentZ     = vLocalPosition.z - bboxMin.z;
+	float fBendXYLen = length(vBendXY);
+	// Cross-product test: fBendXYLen * cos(20 degrees) > fBentZ * sin(20 degrees)
+	// is equivalent to tilt > 20 degrees, and handles fBentZ <= 0 (over-compressed
+	// vertices pushed at or below the base) cleanly without a divide.
+	if (fBendXYLen > 0.001 &&
+	    fBendXYLen * fMaxTiltCos > max(fBentZ, 0.0) * fMaxTiltSin)
+	{
+		vec2 vBendDir = vBendXY / fBendXYLen;
+		vLocalPosition.xy = vRestXY + vBendDir * heightFromBase * fMaxTiltSin;
+		vLocalPosition.z  = bboxMin.z + heightFromBase * fMaxTiltCos;
+	}
+
+	// Pass data to fragment shader for lighting adjustments
+	vPlantHeight = fNormalizedHeight;
+	vWindIntensity = clamp(length(targetDisplacement) / (fPlantHeight * 0.5 + 0.001) + fMaxLocalForce, 0.0, 1.0);
+
+	// Apply tileset mesh offset if needed
+	if (fTilesetMeshOffsetZ != 0.0)
+	{
+		vLocalPosition.z += fTilesetMeshOffsetZ;	
+	}
+	
+	/////////////////////////////////////////////
+	// CUSTOM SECTION END: Plant wind animation
+	/////////////////////////////////////////////
+	
+	vec4 vPosProj;
+
+	#if POSITION_VIEW == 1
+		vPosView = (m_mv * vLocalPosition).xyz;
+
+		vPosProj = m_proj * vec4(vPosView.x, vPosView.y, vPosView.z, 1.0);
+
+		#if NORMAL_MAP == 1
+			// Rotate the tangent around the normal.
+			// Gram-Schmidt orthogonalization.
+			//vVertexTangent = vVertexTangent - vVertexNormal * fHandedness * (dot(vVertexTangent, vVertexNormal));
+			// The two fits nicely as:
+			//vVertexTangent = vVertexTangent * m_texture[0][0] - m_texture[0][0] * dot(vVertexNormal, vVertexTangent) * vVertexNormal + m_texture[1][0] * cross(vVertexNormal, vVertexTangent);
+			vVertexTangent = mat3(m_mv) * vVertexTangent;
+		#endif
+
+		#if VERTEX_NORMAL == 1
+			vVertexNormal = mat3(m_mv) * vVertexNormal;
+			//if(vVertexNormal.z < 0.0) vVertexNormal = -vVertexNormal;
+		#endif
+	
+	#else 
+	
+		vPosProj = m_mvp * vLocalPosition;
+	#endif
+
+	gl_Position = vPosProj;
+	
+	#if POSITION_WORLD == 1
+		vPosWorld = (m_vp_inv * vPosProj).xyz;
+	#endif 
+
+
+	#if NO_TEXTURE != 1
+
+		#if NORMAL_MAP == 1
+			fTextureHandedness = fHandedness;
+		#endif
+		
+
+		#if NO_TEXTURE_COORDS != 1
+			vVertexTexCoords = mat2(m_texture) * vTcIn.xy;
+		#else
+			vVertexTexCoords = vec2(0.5, 0.5);
+		#endif
+
+	#endif
+}
+
+// From ovr\"inc_standard" => ApplyStandardShader() 
+void ApplyStandardShaderOverride()
+{
+	TransformMainCoordinatesOverride();
+
+	#if KEYHOLING == 1
+	SetupKeyholeFactors();
+	#endif 
+	// Used for both specular light and environment map.
+	#if ((ENVIRONMENT_MAP == 1 || SPECULAR_LIGHT == 1) && FRAGMENT_NORMAL != 1)
+		SetupViewToSurfaceNormal();
+	#endif
+
+	#if LIGHTING == 1
+
+		SetupLights();
+
+		// Sets initial vertex color. For vertex lighting, this is done as part of the ComputeLighting call instead.
+		#if FRAGMENT_LIGHTING == 1
+			// Nothing for now.
+		#elif FRAGMENT_NORMAL == 1
+
+			if(staticLighting == 1)
+			{
+				VertexStaticLighting = ApplyColorSpace(vColor.rgb);
+			}
+			else
+			{
+				VertexStaticLighting = COLOR_BLACK.rgb;
+			}	
+			
+		#else
+
+			VertexColor = COLOR_WHITE;
+			#if SPECULAR_LIGHT == 1
+				SetupSpecularity(materialFrontDiffuse.rgb);
+			#endif
+			ComputeLighting(VertexColor, vVertexNormal);
+			
+		#endif
+
+	#elif VERTEX_COLOR == 1
+	
+		VertexColor *= ApplyColorSpace(vColor);
+
+	#endif
+
+	#if (ENVIRONMENT_MAP == 1 || SPECULAR_LIGHT == 1) && FRAGMENT_NORMAL != 1
+		if(envMapCube == 1)
+		{
+			vVertexTexCoordsEnvironmentCube = CalculateEnvironmentTexCoordsCube(vVertexNormal);
+			vVertexTexCoordsEnvironment = vec2(0.0, 0.0);
+		}
+		else
+		{
+			vVertexTexCoordsEnvironment = CalculateEnvironmentTexCoords(vVertexNormal);
+			vVertexTexCoordsEnvironmentCube = vec3(0.0, 0.0, 0.0);
+		}
+	#endif
+
+	#if FOG == 1
+		SetupFog();
+	#endif
+}
+
+void main ()
+{
+	ApplyStandardShaderOverride();
+	
+}

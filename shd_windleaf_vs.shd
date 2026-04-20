@@ -1,0 +1,496 @@
+//=============================================================================
+// SHD_WINDLEAF_VS.SHD
+// Wind-animated leaf/canopy vertex shader for tree foliage. Override of
+// vslit_nm.shd
+//
+// Overridden stock functions (diff against on vendor sync):
+//   TransformMainCoordinatesOverride() <- inc_transform::TransformMainCoordinates()
+//   ApplyStandardShaderOverride()      <- inc_standard::ApplyStandardShader()
+//
+// Custom sections in this file (grep "CUSTOM SECTION"):
+//   CUSTOM SECTION: Leaf wind animation + canopy occlusion
+//     Per-vertex flutter (primary sway + high-freq flutter + shimmer + gusts),
+//     vertical lift/drop, canopy-interior occlusion calculation, and local-
+//     wind-source response with rustle/wave zones. Note: leaves do not use
+//     the cantilever shear model that grass/plant use - they move per-vertex
+//     with random offsets, since leaves are not rigid blade structures.
+//     Inserted between the skinmesh block and the projection / tangent setup
+//     code that we kept verbatim from the stock shader.
+//
+// Varyings to shd_windleaf_fs.shd:
+//   vLeafVariation    float   0-1 pseudo-random per leaf
+//   vWindIntensity    float   0 still, 1 max movement
+//   vCanopyOcclusion  float   0 fully occluded (interior), 1 no occlusion (edges)
+//
+// On magic numbers in this file:
+// This shader went through many iterations of visual tuning. Sway strength
+// and sway speed arrive as material parameters (fSwayStrength, fSwaySpeed
+// uniforms) and are denormalized here with fixed legacy scale factors
+// different from the grass/plant shaders (leaves need more amplitude per
+// unit of authored sway, hence /43.0 vs /60.0). The rest of the in-file
+// constants (flutter/shimmer frequency coefficients, canopy occlusion
+// curves, gust parameters, etc.) are equally load-bearing. Hundreds of
+// tree and canopy meshes and materials are authored against these exact
+// values - a refactor of any of them is a content-side migration affecting
+// the whole game, not a shader-side change.
+//=============================================================================
+
+#define SHADER_TYPE 1
+
+#define FOG 1
+#define KEYHOLING 1
+
+#define NORMAL_MAP 1
+#define LIGHTING 1
+
+#include "inc_standard"
+
+uniform mat4 m_m;
+uniform float fSwaySpeed;
+uniform float fSwayStrength;
+
+uniform sampler2D texUnit6;
+
+// Pass wind data to fragment shader for lighting effects
+out float vLeafVariation;        // Leaf variation value (0-1 random per leaf)
+out float vWindIntensity;      // Wind strength for lighting effects
+out float vCanopyOcclusion;  // 0 = fully occluded (center), 1 = no occlusion (edges)
+
+// Generate pseudo-random value from vertex ID for individual leaf movement
+float GenerateWindNoise(float fVertexId) 
+{
+    return fract(sin(fVertexId * .01) * 43758.5453);
+}
+
+// From ovr\"inc_transform" => TransformMainCoordinates() 
+void TransformMainCoordinatesOverride()
+{
+	vec4 vLocalPosition = vec4(0.0, 0.0, 0.0, 0.0);
+
+	#if NORMAL_MAP == 1
+		vVertexTangent = vec3(0.0, 0.0, 0.0);
+	#endif
+	#if VERTEX_NORMAL == 1
+		vVertexNormal = vec3(0.0, 0.0, 0.0);
+	#endif
+	if(skinmesh == 1)
+	{
+		int index = 0;
+		
+		if(vWeight.x > 0.0)
+		{
+			index = int(vIndex.x);
+			vLocalPosition = SkinmeshTransformPosition(vPos, index) * vWeight.x;
+			#if NORMAL_MAP == 1
+				vVertexTangent = SkinmeshTransformOrientation(vTangent, index) * vWeight.x;
+			#endif
+			#if VERTEX_NORMAL == 1
+				vVertexNormal = SkinmeshTransformOrientation(vNormal, index) * vWeight.x;
+			#endif
+		}
+		if(vWeight.y > 0.0)
+		{
+			index = int(vIndex.y);
+			vLocalPosition += SkinmeshTransformPosition(vPos, index) * vWeight.y;
+			#if NORMAL_MAP == 1
+				vVertexTangent = SkinmeshTransformOrientation(vTangent, index) * vWeight.y + vVertexTangent;
+			#endif
+			#if VERTEX_NORMAL == 1
+				vVertexNormal = SkinmeshTransformOrientation(vNormal, index) * vWeight.y + vVertexNormal;
+			#endif
+		}
+		if(vWeight.z > 0.0)
+		{
+			index = int(vIndex.z);
+			vLocalPosition += SkinmeshTransformPosition(vPos, index) * vWeight.z;
+			#if NORMAL_MAP == 1
+				vVertexTangent = SkinmeshTransformOrientation(vTangent, index) * vWeight.z + vVertexTangent;
+			#endif
+			#if VERTEX_NORMAL == 1
+				vVertexNormal = SkinmeshTransformOrientation(vNormal, index) * vWeight.z + vVertexNormal;
+			#endif
+		}
+		if(vWeight.w > 0.0)
+		{
+			index = int(vIndex.w);
+			vLocalPosition += SkinmeshTransformPosition(vPos, index) * vWeight.w;
+			#if NORMAL_MAP == 1
+				vVertexTangent = SkinmeshTransformOrientation(vTangent, index) * vWeight.w + vVertexTangent;
+			#endif
+			#if VERTEX_NORMAL == 1
+				vVertexNormal = SkinmeshTransformOrientation(vNormal, index) * vWeight.w + vVertexNormal;
+			#endif
+		}
+	}
+	else
+	{
+		vLocalPosition = vPos;
+		#if VERTEX_NORMAL == 1
+			vVertexNormal = vNormal;
+		#endif
+		#if NORMAL_MAP == 1
+			vVertexTangent = vTangent;
+		#endif
+	}
+     
+	/////////////////////////////////////////////
+	// CUSTOM SECTION BEGIN: Leaf wind animation + canopy occlusion
+	/////////////////////////////////////////////
+	
+	// Calculate base wind strength from global area settings
+	float fAreaWind = length(areaGlobalWind.xy);
+	 
+	// Apply default wind if none set in toolset
+	if (fAreaWind < 0.01) 
+    {
+      if ( (areaFlags == 1) || (areaFlags == 3) || (areaFlags == 5) || (areaFlags == 7) )
+	  {
+	    fAreaWind = 0.178;  // Indoor areas
+	  }
+	  else
+	  {
+	    fAreaWind = 0.356;  // Outdoor areas
+	  }  
+	}
+
+    // Scale material parameters to usable range
+	float fSwayStrengthMult = fSwayStrength / 43.0;    // Controls movement amplitude (slightly increased from /45)
+	float fSwaySpeedMult = fSwaySpeed * 350.0;         // Controls animation speed
+	
+	// Get world position for texture sampling and variation
+	vec4 vWorldPos = m_m * vLocalPosition;
+	
+	/////////////////////////////////////////////
+	// CANOPY INTERIOR OCCLUSION CALCULATION
+	/////////////////////////////////////////////
+	
+	// Calculate distance from bounding box center
+	vec3 bboxCenter = (bboxMin + bboxMax) * 0.5;
+	vec3 bboxSize = bboxMax - bboxMin;
+	
+	// Get position relative to center in local space
+	vec3 relativePos = vLocalPosition.xyz - bboxCenter;
+	
+	// Calculate normalized distance from center (0 at center, 1 at edges)
+	// Using ellipsoid formula for better results than sphere
+	vec3 normalizedOffset = abs(relativePos) / (bboxSize * 0.5 + 0.001); // Prevent division by zero
+	float distFromCenter = length(normalizedOffset);
+	
+	// Create occlusion gradient with power curve for falloff control
+	vCanopyOcclusion = pow(clamp(distFromCenter, 0.0, 1.0), 1.5);
+	
+	// Add vertical bias - slightly darker at bottom-center of canopy
+	float verticalBias = (vLocalPosition.z - bboxMin.z) / max(bboxSize.z, 0.001);
+	vCanopyOcclusion = mix(vCanopyOcclusion, 1.0, verticalBias * 0.3);
+	
+	// Use 3D noise to break up the uniform gradient for organic variation
+	// Sample noise at world position for consistency across vertices
+	// Use XY coordinates with Z as an offset for variation
+	vec2 noiseCoords = vWorldPos.xy * 0.1 + vec2(vWorldPos.z * 0.05, vWorldPos.z * 0.03);
+	float noiseVariation = texture(texUnit6, noiseCoords).r;
+	// Blend noise to add 0-20% variation to the occlusion
+	vCanopyOcclusion = clamp(mix(vCanopyOcclusion, 1.0, noiseVariation * 0.2), 0.0, 1.0);
+	
+	// Ensure edges always remain relatively bright
+	vCanopyOcclusion = max(vCanopyOcclusion, 0.15); // Minimum 15% brightness
+	
+	/////////////////////////////////////////////
+	// END CANOPY INTERIOR OCCLUSION
+	/////////////////////////////////////////////
+	
+	// Calculate height gradient for upper leaves to sway more
+	float fMeshHeight = max(bboxMax.z - bboxMin.z, 0.001);
+	float fHeightFromBottom = vLocalPosition.z - bboxMin.z;
+	float fHeightFactor = clamp(fHeightFromBottom / fMeshHeight, 0.0, 1.0);
+	
+	// Apply subtle height-based wind amplification (70% at bottom, 100% at top)
+	float fHeightWindMultiplier = 0.7 + 0.3 * fHeightFactor;
+	
+	// Sample noise texture for coordinated wind flow patterns
+	vec2 scrolledUV = vWorldPos.xy * 0.05 + vec2(worldtimerTimeOfDay * 0.00002, 0.0);
+	float fTextureNoise = texture(texUnit6, scrolledUV).r;
+	
+	// Generate per-vertex random value for individual leaf movement
+	float fVertexRandom = GenerateWindNoise(gl_VertexID);
+	
+	// Combine individual movement (80%) with coordinated flow (20%)
+	float fVertexNoise = fVertexRandom * 0.8 + fTextureNoise * 0.2;
+	
+	// Create spatial variation across the mesh
+	float fPositionMask = fract(vWorldPos.x * 0.23 + vWorldPos.y * 0.31);
+	float fLeafPhase = fVertexNoise * 6.28318;
+	
+	// Add wave propagation through the tree
+	float fSpatialPhase = dot(vWorldPos.xy, vec2(0.1, 0.08));
+	
+	//-------------------------------------
+	// PRIMARY SWAY - Main branch movement
+	//-------------------------------------
+	float fTimePhase = worldtimerTimeOfDay / fSwaySpeedMult;
+	float fPrimaryPhase = fLeafPhase + fTimePhase + fSpatialPhase;
+	float fPrimarySway = sin(fPrimaryPhase) * fSwayStrengthMult;
+	
+	//-------------------------------------
+	// SECONDARY FLUTTER - Leaf shaking
+	//-------------------------------------
+	float fFlutterPhase = fLeafPhase * 3.7 + fTimePhase * 8.5 + fSpatialPhase * 2.3;
+	float fFlutterAmount = sin(fFlutterPhase) * fSwayStrengthMult * 0.05;
+	
+	//-------------------------------------
+	// TERTIARY SHIMMER - Subtle vibration
+	//-------------------------------------
+	float fShimmerPhase = fVertexNoise * 17.3 + fTimePhase * 23.0;
+	float fShimmerAmount = sin(fShimmerPhase) * fSwayStrengthMult * 0.01;
+	
+	//-------------------------------------
+	// WIND GUSTS - Intermittent stronger movement
+	//-------------------------------------
+	float fGustPhase = fTimePhase * 0.3 + fSpatialPhase * 0.5;
+	float fGustIntensity = smoothstep(0.0, 1.0, sin(fGustPhase) * 0.5 + 0.5);
+	fGustIntensity *= smoothstep(0.0, 1.0, sin(fGustPhase * 2.7) * 0.5 + 0.5);
+	
+	// Combine all movement components
+	float fTotalMovement = fPrimarySway + fFlutterAmount + fShimmerAmount;
+	fTotalMovement *= (1.0 + fGustIntensity * 0.6);  // Gusts amplify movement by 60%
+	
+	// Apply height gradient
+	fTotalMovement *= fHeightWindMultiplier;
+	
+	// Final scaling for material compatibility
+	fTotalMovement *= 5.0;
+	
+	// Calculate wind direction with perpendicular component for variation
+	vec2 windDir = normalize(areaGlobalWind.xy + vec2(0.001));
+	vec2 perpWind = vec2(-windDir.y, windDir.x);
+	
+	// Add chaotic movement to individual leaves
+	float fChaosAmount = fPositionMask * 0.3;
+	
+	// Calculate final leaf displacement
+	vec2 horizontalDisplacement = windDir * fTotalMovement + perpWind * fTotalMovement * fChaosAmount;
+	
+	//===========================================
+	// LOCAL WIND SOURCES
+	// Physics objects and player movement effects
+	//===========================================
+	
+	float fMaxLocalForce = 0.0;
+	vec2 vLocalWindDisplacement = vec2(0.0);
+	
+	for (int i = 0; i < MAX_WINDS; i++) {
+		// Process all active wind sources
+		if (i >= windPointSourcesCount) break;
+		
+		// Skip inactive or weak sources
+		if(windPointSourcesDuration[i] <= 0.0) continue;
+		if(windPointSourcesIntensity[i] <= 0.0) continue;
+		
+		// Calculate 3D distance to wind source
+		vec3 vToSource = vWorldPos.xyz - windPointSourcesPosition[i];
+		float fDistanceSq = dot(vToSource, vToSource);
+		
+		// Check spherical radius of influence
+		float fRadiusSq = windPointSourcesRadius[i] * windPointSourcesRadius[i];
+		float fExtendedRadiusSq = fRadiusSq * 2.25;  // 1.5x radius for fade zone
+		
+		if(fDistanceSq > fExtendedRadiusSq) continue;
+		
+		float fDistance = sqrt(fDistanceSq);
+		float fBaseRadius = windPointSourcesRadius[i];
+		
+		// Calculate horizontal push direction
+		vec2 pushDir = length(vToSource.xy) > 0.001 ? normalize(vToSource.xy) : vec2(1.0, 0.0);
+		
+		// Calculate time-based animation parameters
+		float fRelativeTime = windPointSourcesTimeRemaining[i] / max(windPointSourcesDuration[i], 0.001);
+		float fElapsedTime = windPointSourcesDuration[i] - windPointSourcesTimeRemaining[i];
+		
+		// Apply distance-based fade at edges
+		float fFadeMultiplier = 1.0;
+		if(fDistance > fBaseRadius) {
+			float fExtendedRadius = fBaseRadius * 1.5;
+			fFadeMultiplier *= smoothstep(fExtendedRadius, fBaseRadius, fDistance);
+		}
+		
+		// Calculate force based on distance zones
+		float fLocalForce = 0.0;
+		
+		// Inner zone: Strong rustling effect
+		if(fDistance < fBaseRadius * 0.5) {
+			float fRustleFactor = smoothstep(fBaseRadius * 0.5, 0.0, fDistance);
+			float fRustlePhase = fElapsedTime * 15.0 + fVertexNoise * 10.0;
+			fLocalForce = fRustleFactor * windPointSourcesIntensity[i] * (0.5 + 0.5 * sin(fRustlePhase));
+		}
+		// Outer zone: Wave propagation
+		else if(fDistance < fBaseRadius) {
+			float fWaveFactor = (fDistance - fBaseRadius * 0.5) / (fBaseRadius * 0.5);
+			fLocalForce = sin(fWaveFactor * 3.14159) * windPointSourcesIntensity[i] * 0.7;
+		}
+		
+		// Apply smooth fade in/out transitions
+		// Thresholds named to match grass/plant VS for cross-file consistency; if
+		// Beamdog ever touches the fade timing of local wind sources, a single
+		// search for "fFadeInThreshold" finds all three shaders at once.
+		float fFadeInMod = 1.0;
+		float fFadeOutMod = 1.0;
+		float fFadeInThreshold = 0.3;   // First 30% of effect duration ramps in
+		float fFadeOutThreshold = 0.5;  // Last 50% of effect duration ramps out
+
+		if (fElapsedTime < fFadeInThreshold * windPointSourcesDuration[i]) {
+			float fFadeInNorm = fElapsedTime / (fFadeInThreshold * windPointSourcesDuration[i]);
+			fFadeInMod = fFadeInNorm * fFadeInNorm * (3.0 - 2.0 * fFadeInNorm);
+		}
+
+		if (fRelativeTime < fFadeOutThreshold) {
+			float fFadeOutNorm = fRelativeTime / fFadeOutThreshold;
+			fFadeOutMod = fFadeOutNorm * fFadeOutNorm * (3.0 - 2.0 * fFadeOutNorm);
+		}
+		
+		float fFinalModifier = min(fFadeInMod, fFadeOutMod) * fFadeMultiplier;
+		fLocalForce *= fFinalModifier;
+		
+		// Add turbulent flutter for realistic leaf response
+		float fTurbulence = fVertexNoise * 0.4 * windPointSourcesIntensity[i];
+		vec2 perpDir = vec2(-pushDir.y, pushDir.x);
+		vLocalWindDisplacement += pushDir * fLocalForce + perpDir * fTurbulence * sin(fElapsedTime * 12.0) * fFinalModifier;
+		
+		fMaxLocalForce = max(fMaxLocalForce, abs(fLocalForce));
+	}
+	
+	// Combine global and local wind (local has reduced effect on leaves)
+	horizontalDisplacement += vLocalWindDisplacement * 0.3;
+	
+	// Apply final horizontal displacement
+	vLocalPosition.xy += horizontalDisplacement * fAreaWind;
+	
+	// Add vertical movement for leaves lifting and dropping
+	float fVerticalMovement = (abs(fTotalMovement) + fMaxLocalForce * 0.5) * fAreaWind * 0.25;
+	vLocalPosition.z += fVerticalMovement * (0.5 + 0.5 * sin(fPrimaryPhase * 0.7));
+	
+	// Store data for fragment shader lighting effects
+	vLeafVariation = fPositionMask;  // Leaf variation value
+	vWindIntensity = clamp(abs(fTotalMovement) * 2.0 + fMaxLocalForce, 0.0, 1.0);
+	
+	/////////////////////////////////////////////
+	// CUSTOM SECTION END: Leaf wind animation + canopy occlusion
+	/////////////////////////////////////////////
+	
+	vec4 vPosProj;
+
+	#if POSITION_VIEW == 1
+		vPosView = (m_mv * vLocalPosition).xyz;
+
+		vPosProj = m_proj * vec4(vPosView.x, vPosView.y, vPosView.z, 1.0);
+
+		#if NORMAL_MAP == 1
+			// Rotate the tangent around the normal.
+			// Gram-Schmidt orthogonalization.
+			//vVertexTangent = vVertexTangent - vVertexNormal * fHandedness * (dot(vVertexTangent, vVertexNormal));
+			// The two fits nicely as:
+			//vVertexTangent = vVertexTangent * m_texture[0][0] - m_texture[0][0] * dot(vVertexNormal, vVertexTangent) * vVertexNormal + m_texture[1][0] * cross(vVertexNormal, vVertexTangent);
+			vVertexTangent = mat3(m_mv) * vVertexTangent;
+		#endif
+
+		#if VERTEX_NORMAL == 1
+			vVertexNormal = mat3(m_mv) * vVertexNormal;
+			//if(vVertexNormal.z < 0.0) vVertexNormal = -vVertexNormal;
+		#endif
+	
+	#else 
+	
+		vPosProj = m_mvp * vLocalPosition;
+	#endif
+
+	gl_Position = vPosProj;
+	
+	#if POSITION_WORLD == 1
+		vPosWorld = (m_vp_inv * vPosProj).xyz;
+	#endif 
+
+
+	#if NO_TEXTURE != 1
+
+		#if NORMAL_MAP == 1
+			fTextureHandedness = fHandedness;
+		#endif
+		
+
+		#if NO_TEXTURE_COORDS != 1
+			vVertexTexCoords = mat2(m_texture) * vTcIn.xy;
+		#else
+			vVertexTexCoords = vec2(0.5, 0.5);
+		#endif
+
+	#endif
+}
+
+// From ovr\"inc_standard" => ApplyStandardShader() 
+void ApplyStandardShaderOverride()
+{
+	TransformMainCoordinatesOverride();
+
+	#if KEYHOLING == 1
+	SetupKeyholeFactors();
+	#endif 
+	// Used for both specular light and environment map.
+	#if ((ENVIRONMENT_MAP == 1 || SPECULAR_LIGHT == 1) && FRAGMENT_NORMAL != 1)
+		SetupViewToSurfaceNormal();
+	#endif
+
+	#if LIGHTING == 1
+
+		SetupLights();
+
+		// Sets initial vertex color. For vertex lighting, this is done as part of the ComputeLighting call instead.
+		#if FRAGMENT_LIGHTING == 1
+			// Nothing for now.
+		#elif FRAGMENT_NORMAL == 1
+
+			if(staticLighting == 1)
+			{
+				VertexStaticLighting = ApplyColorSpace(vColor.rgb);
+			}
+			else
+			{
+				VertexStaticLighting = COLOR_BLACK.rgb;
+			}	
+			
+		#else
+
+			VertexColor = COLOR_WHITE;
+			#if SPECULAR_LIGHT == 1
+				SetupSpecularity(materialFrontDiffuse.rgb);
+			#endif
+			ComputeLighting(VertexColor, vVertexNormal);
+			
+		#endif
+
+	#elif VERTEX_COLOR == 1
+	
+		VertexColor *= ApplyColorSpace(vColor);
+
+	#endif
+
+	#if (ENVIRONMENT_MAP == 1 || SPECULAR_LIGHT == 1) && FRAGMENT_NORMAL != 1
+		if(envMapCube == 1)
+		{
+			vVertexTexCoordsEnvironmentCube = CalculateEnvironmentTexCoordsCube(vVertexNormal);
+			vVertexTexCoordsEnvironment = vec2(0.0, 0.0);
+		}
+		else
+		{
+			vVertexTexCoordsEnvironment = CalculateEnvironmentTexCoords(vVertexNormal);
+			vVertexTexCoordsEnvironmentCube = vec3(0.0, 0.0, 0.0);
+		}
+	#endif
+
+	#if FOG == 1
+		SetupFog();
+	#endif
+}
+
+void main ()
+{
+	ApplyStandardShaderOverride();
+	
+}

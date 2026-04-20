@@ -1,0 +1,21 @@
+renderhint NormalAndSpecMapped
+
+customshadervs shd_windleaf_vs
+customshaderfs shd_windleaf_fs
+
+twosided 1
+
+texture0 tex_core_0429_d
+texture1 tex_core_0429_n
+texture2 null
+texture3 tex_core_0429_r
+texture4 null
+texture5 null
+texture6 tex_noise_01
+
+//turn up to decrease the speed of the sway, 1.0 is normalized to tree leaves
+parameter float fSwaySpeed 2.0
+
+//turn up to increase the spread of the sway, 1.0 is normalized to tree leaves
+parameter float fSwayStrength 0.1
+ 

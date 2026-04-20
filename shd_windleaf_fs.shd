@@ -1,0 +1,438 @@
+//=============================================================================
+// SHD_WINDLEAF_FS.SHD
+// Wind-animated fragment shader for tree leaves / canopy foliage. Override
+// of fslit_sm_nm.shd.
+//
+// Overridden stock functions (diff against referenceshaders/ on vendor sync):
+//   ComputeLightingOverride()      <- inc_lighting::ComputeLighting()
+//   ApplyStandardShaderOverride()  <- inc_standard::ApplyStandardShader() [FS side]
+//
+// Custom sections in this file (grep "CUSTOM SECTION"):
+//   CUSTOM SECTION: Leaf-specific lighting model
+//     Per-leaf variation brightness, view-dependent transmittance,
+//     wrapped diffuse, canopy interior occlusion (darker toward mass
+//     center), translucent backlighting with interior fade, wind-based
+//     tint and glimmer, rim lighting. Uses the vCanopyOcclusion varying
+//     that the VS computes from bbox-relative position.
+//
+// Varyings from shd_windleaf_vs.shd:
+//   vLeafVariation    float   0-1 pseudo-random per leaf
+//   vWindIntensity    float   0 still, 1 max movement
+//   vCanopyOcclusion  float   0 fully occluded (interior), 1 no occlusion (edges)
+//
+// On magic numbers in this file:
+// This shader went through many iterations of visual tuning. Leaf lighting
+// uses different coefficients from grass/plant (higher fInteriorDarkening,
+// neutral transmission tint to let leaf texture dominate, glimmer
+// frequency coefficients, etc.) because canopy foliage behaves visually
+// differently from ground vegetation. Values are tuned against hundreds
+// of authored tree and canopy meshes and their materials. A refactor of
+// any of them is a content-side migration affecting the whole game, not
+// a shader-side change.
+//=============================================================================
+
+#define SHADER_TYPE 2
+
+#define FOG 1
+#define KEYHOLING 1
+#define LIGHTING 1
+
+#define NORMAL_MAP 1
+#define SPECULAR_MAP 1
+#define ROUGHNESS_MAP 1
+#define HEIGHT_MAP 1
+#define SELF_ILLUMINATION_MAP 1
+#define ENVIRONMENT_MAP 0
+
+// Wind data from vertex shader
+in float vLeafVariation;        // Leaf variation value (0-1 random per leaf)
+in float vWindIntensity;        // Wind strength for lighting effects
+in float vCanopyOcclusion;  // 0 = fully occluded (center), 1 = no occlusion (edges)
+
+#include "inc_standard"
+
+// Custom lighting implementation for leaf material
+void ComputeLightingOverride(inout vec4 ColorIO, vec3 vNormalThis)
+{
+    AmbientLight = lightAreaAmbient;
+    DiffuseLight = COLOR_BLACK.rgb;
+    
+    #if FRAGMENT_LIGHTING == 0
+        StaticLight = COLOR_BLACK.rgb;
+    #endif
+    
+    #if LIGHT_SUBSURFACE_SCATTERING == 1
+    SubsurfaceLight = COLOR_BLACK.rgb;
+    #endif
+    
+    #ifdef LIGHT_TRANSLUCENCE_GENERATE_VALUE
+        LIGHT_TRANSLUCENCE_VALUE = (1.0-ColorIO.a);
+    #endif
+
+    #if SPECULAR_LIGHT == 1
+        SpecularLight = COLOR_BLACK.rgb;
+
+        fNdotV = dot(vNormalThis, -vViewToSurface_n);
+        if(fNdotV < 0.0)
+        {
+            vNormalThis = normalize(vNormalThis + fNdotV * vViewToSurface_n);
+            fNdotV = 0.0;
+        }
+        fRoughness_sq = MATERIAL_ROUGHNESS_VALUE * MATERIAL_ROUGHNESS_VALUE;
+        fRoughness_sq_inv = 1.0-fRoughness_sq;
+        
+        #if SPECULAR_GEOMETRIC_SHADOWING_TERM == 1
+            fGeomTerm = MATERIAL_ROUGHNESS_VALUE * 0.5;
+        #elif SPECULAR_GEOMETRIC_SHADOWING_TERM == 2
+            fGeomTerm = sqr(sqrt(MATERIAL_ROUGHNESS_VALUE)*0.5 + 0.5) * 0.5;
+        #elif SPECULAR_GEOMETRIC_SHADOWING_TERM == 3
+            fGeomTerm = MATERIAL_ROUGHNESS_VALUE * 0.65;
+        #elif SPECULAR_GEOMETRIC_SHADOWING_TERM == 4
+            fGeomTerm = MATERIAL_ROUGHNESS_VALUE * 0.425;
+        #endif
+        
+        fGeomTerm_inv = 1.0-fGeomTerm;
+        
+        #if SPECULAR_DISTRIBUTION_MODEL == 0
+            fShininess = 2.0 / (fRoughness_sq + 0.001) - 2.0;
+        #endif
+    #endif
+
+    #if FRAGMENT_LIGHTING == 0
+        #if SHADER_TYPE == 1
+            if(staticLighting == 1)
+            {
+                StaticLight = ApplyColorSpace(vColor.rgb);
+            }
+        #elif SHADER_TYPE == 2 && NORMAL_MAP == 1
+            if(staticLighting == 1)
+            {
+                ComputeDiffuseLighting(VertexStaticLighting.rgb, vStaticLightDirOut, vNormalThis, 1.0, true);
+            }
+        #endif
+    #endif
+    
+    /////////////////////////////////////////////
+    // CUSTOM SECTION BEGIN: Leaf-specific lighting model
+    /////////////////////////////////////////////
+    
+    // Calculate standard light direction
+    float fNdotL = dot(vNormalThis, lightAreaDiffuseDirection);
+    
+    // Use variation data for non-uniform leaf appearance
+    float fLeafVariation = vLeafVariation;
+    float fLeafBrightness = 0.9 + fLeafVariation * 0.2;  // 90-110% brightness variation
+    
+    // Calculate view-dependent effects for thin material
+    float fNdotV = abs(dot(vNormalThis, -vViewToSurface_n));
+    float fGrazingAngle = pow(1.0 - fNdotV, 2.0);
+    
+    // Universal translucency for all vegetation types
+    float fBaseTransmittance = 0.35;  // Compromise value - works for most vegetation
+    float fDynamicTransmittance = fBaseTransmittance + 
+                                   (fGrazingAngle * 0.2) +
+                                   (fLeafVariation * 0.1);
+    
+    // Wrapped diffuse lighting for subsurface scattering
+    float fWrap = 0.5 + fLeafVariation * 0.1;  // More universal wrap value
+    float fWrappedNdotL = (fNdotL + fWrap) / (1.0 + fWrap);
+    fWrappedNdotL = max(0.0, fWrappedNdotL);
+    
+    // Calculate base diffuse lighting
+    vec3 leafDiffuse = lightAreaDiffuse * fWrappedNdotL;
+    
+    /////////////////////////////////////////////
+    // CANOPY INTERIOR OCCLUSION
+    // Darker toward center of foliage mass
+    /////////////////////////////////////////////
+    
+    // Control how much darker the interior gets (0.4 = 40% darker at center)
+    float fInteriorDarkening = 0.4;
+    float fOcclusionEffect = mix(1.0 - fInteriorDarkening, 1.0, vCanopyOcclusion);
+    
+    // Apply occlusion to diffuse before other multipliers
+    leafDiffuse *= fOcclusionEffect;
+    
+    // Universal backlighting for all leaf types
+    if (fNdotL < 0.0) {
+        // Calculate backlight intensity
+        float fBacklight = pow(max(0.0, -fNdotL), 1.0) * fDynamicTransmittance;
+        
+        // Reduce translucency in dense interior areas
+        fBacklight *= mix(0.5, 1.0, vCanopyOcclusion);
+        
+        // Neutral transmission - let the texture color define the leaf appearance
+        vec3 transmittedTint = vec3(1.0, 1.0, 1.0);  // Completely neutral
+        
+        // Add subtle variation between leaves
+        transmittedTint *= (0.95 + fLeafVariation * 0.1);  // Reduced variation
+        
+        vec3 transmittedColor = lightAreaDiffuse * transmittedTint;
+        leafDiffuse += transmittedColor * fBacklight;  // No artificial boost
+        
+        // Reduce thin material glow in interior
+        float fThinGlow = 0.2 * (0.9 + fLeafVariation * 0.1) * mix(0.6, 1.0, vCanopyOcclusion);
+        leafDiffuse += lightAreaDiffuse * fThinGlow;
+    }
+    
+    // Wind-based lighting effects
+    float fWindBrightness = 1.0 + vWindIntensity * 0.15;
+    
+    // Glimmer effect when leaves move
+    float fGlimmer = vWindIntensity * 0.2 * (0.5 + 0.5 * sin(vWindIntensity * 20.0));
+    
+    // Color variation from movement
+    vec3 windTint = vec3(1.0 + vWindIntensity * 0.04,
+                          1.0 + vWindIntensity * 0.06,
+                          1.0 - vWindIntensity * 0.03);
+    
+    // Edge rim lighting
+    float fRimLight = fGrazingAngle * 0.15 * (1.0 + vWindIntensity * 0.5);
+    
+    // Add subtle color temperature shift - interior is slightly cooler/greener
+    vec3 interiorTint = vec3(0.97, 1.0, 0.99);  // Subtle green-blue tint
+    leafDiffuse = mix(leafDiffuse * interiorTint, leafDiffuse, vCanopyOcclusion);
+    
+    // Combine all lighting components
+    leafDiffuse *= fLeafBrightness * fWindBrightness * windTint;
+    leafDiffuse *= (1.0 + fRimLight + fGlimmer);
+    
+    // Update diffuse channel
+    DiffuseLight += leafDiffuse;
+    
+    // Modify ambient boost to also account for occlusion
+    float fAmbientBoost = (0.2 + fLeafVariation * 0.05) * fOcclusionEffect;
+    AmbientLight = AmbientLight * (1.0 + fAmbientBoost);
+    
+    /////////////////////////////////////////////
+    // CUSTOM SECTION END: Leaf-specific lighting model
+    /////////////////////////////////////////////
+	
+    // Process point light sources
+    for (int i = 0; i < numLights; i++) 
+    {
+        #if GAMMA_CORRECTION == 1
+            if(lightColor[i].a < 0.0)
+            {
+                ComputePointLightSource(lightColor[i].rgb, lightPosition[i].xyz - vPosView, -lightColor[i].a, vNormalThis, true);
+            }
+            else
+            {
+                ComputePointLightSource(lightColor[i].rgb, lightPosition[i].xyz - vPosView, lightColor[i].a, vNormalThis, false);
+            }
+        #else
+            if(dot(lightAmbient[i].rgb, lightAmbient[i].rgb) == 0.0)
+            {
+                ComputePointLightSource(lightDiffuse[i].rgb, lightPosition[i].xyz - vPosView, lightQuadraticAtten[i], vNormalThis, false);
+            }
+            else
+            {
+                ComputePointLightSource(lightAmbient[i].rgb, lightPosition[i].xyz - vPosView, lightQuadraticAtten[i], vNormalThis, true);
+            }
+        #endif
+    }
+    
+    AmbientLight *= materialFrontAmbient.rgb;
+    
+    DiffuseLight = 
+                #if LIGHT_FORCE_INDIRECTIONAL == 1
+                (1.0 / (PI) ) * 
+                #endif
+                (
+                DiffuseLight
+                #if FRAGMENT_LIGHTING == 0
+                    + StaticLight
+                #endif
+                ) 
+                * materialFrontDiffuse.rgb;
+                
+    #if LIGHT_SUBSURFACE_SCATTERING == 1
+    SubsurfaceLight = materialFrontDiffuse.rgb * 
+                        (
+                            SubsurfaceLight
+                            #if FRAGMENT_LIGHTING == 0
+                            + StaticLight
+                            #endif
+                        )
+                        / (1.0 + LIGHT_SUBSURFACE_SCATTERING_WRAP)
+                        + AmbientLight;
+    
+    const float fEnergyPreservation = (2.0 * (1.0+LIGHT_SUBSURFACE_SCATTERING_WRAP) / (2.0 + PI * LIGHT_SUBSURFACE_SCATTERING_WRAP));
+    SubsurfaceLight *= fEnergyPreservation;
+    #endif
+
+    #if SPECULAR_LIGHT == 1 && LIGHT_FORCE_INDIRECTIONAL == 0
+        vec3 EnvironmentColor = AmbientLight + DiffuseLight;
+        SpecularLight *= GetSpecularBaseModifier();
+
+        #if SPECULAR_FRESNEL != 0 
+            float fEnvironmentSpecularity = mix(GetFresnelSpecularity(MATERIAL_SPECULARITY_VALUE, fNdotV), MATERIAL_SPECULARITY_VALUE, sqrt(MATERIAL_ROUGHNESS_VALUE));
+        #else
+            #define fEnvironmentSpecularity MATERIAL_SPECULARITY_VALUE
+        #endif
+        
+        #if SPECULAR_FRESNEL != 1
+            SpecularLight *= fEnvironmentSpecularity;
+        #endif
+    
+        #if SHADER_TYPE == 2
+            vec3 vTexEnvironment;
+            #if FRAGMENT_NORMAL != 1 && SHADER_QUALITY_MODE < 2
+                if(envMapCube == 1)
+                {
+                    vTexEnvironment = SampleEnvironmentMapCube(vVertexTexCoordsEnvironmentCube,clamp(MATERIAL_ROUGHNESS_VALUE*fEnvironmentMapRoughnessLODModifier + fEnvironmentMapRoughnessLODOffset, 0.0, fEnvironmentMapCubeRoughnessLODMax));
+                }
+                else
+                {
+                    vTexEnvironment = SampleEnvironmentMap(vVertexTexCoordsEnvironment,clamp(MATERIAL_ROUGHNESS_VALUE*fEnvironmentMapRoughnessLODModifier + fEnvironmentMapRoughnessLODOffset, 0.0, fEnvironmentMapRoughnessLODMax));
+                }
+            #else
+                if(envMapCube == 1)
+                {
+                    vTexEnvironment = SampleEnvironmentMapCube(CalculateEnvironmentTexCoordsCube(vNormalThis),clamp(MATERIAL_ROUGHNESS_VALUE*fEnvironmentMapRoughnessLODModifier + fEnvironmentMapRoughnessLODOffset, 0.0, fEnvironmentMapCubeRoughnessLODMax));
+                }
+                else
+                {
+                    vTexEnvironment = SampleEnvironmentMap(CalculateEnvironmentTexCoords(vNormalThis),clamp(MATERIAL_ROUGHNESS_VALUE*fEnvironmentMapRoughnessLODModifier + fEnvironmentMapRoughnessLODOffset, 0.0, fEnvironmentMapRoughnessLODMax));
+                }
+            #endif
+            
+            EnvironmentColor *= vTexEnvironment.rgb;
+        #else
+            float fGammaFactor = ApplyColorSpace(0.6667);
+            EnvironmentColor*= COLOR_WHITE.rgb * fGammaFactor;
+        #endif
+        
+        SpecularLight += EnvironmentColor 
+                        #if HEIGHT_MAP == 1 && SHADER_TYPE == 2
+                        * fAmbientOcclusionModifier
+                        #endif
+                        * fEnvironmentSpecularity;
+    #endif
+    
+    #if HEIGHT_MAP == 1 && SHADER_TYPE == 2
+        AmbientLight *= fAmbientOcclusionModifier;
+    #endif
+    
+    vec3 TotalLight = materialFrontEmissive.rgb + 
+                #if SPECULAR_LIGHT == 1 && LIGHT_FORCE_INDIRECTIONAL == 0
+                    (1.0 - fEnvironmentSpecularity) * 
+                #endif
+                    (AmbientLight
+                    + DiffuseLight)
+                ;
+
+    TotalLight = max(TotalLight, min(frontLightModelProductSceneColor.rgb * materialFrontDiffuse.rgb, COLOR_WHITE.rgb));
+
+    #if SHADER_TYPE == 2 && SELF_ILLUMINATION_MAP == 1
+        #if MATERIAL_READ_SELF_ILLUMINATION_FROM_SPECULAR_MAP == 1
+            if(texture2Bound != 0)
+            {
+                TotalLight = mix(TotalLight, COLOR_WHITE.rgb, texture2D(texUnit2, vTexCoords).b);
+            }
+        #endif
+    #endif
+
+    #if GAMMA_CORRECTION == 0
+        TotalLight = clamp(TotalLight, 0.0, 1.0);
+    #endif
+
+    ColorIO.rgb*=TotalLight;
+
+    #if SHADER_TYPE == 2 && SELF_ILLUMINATION_MAP == 1
+        #if MATERIAL_READ_SELF_ILLUMINATION_FROM_SPECULAR_MAP != 1
+            if(texture5Bound != 0)
+            {
+                ColorIO.rgb += ApplyColorSpace(texture2D(texUnit5, vTexCoords).rgb);
+            }
+        #endif
+    #endif
+    
+    #if SPECULAR_LIGHT == 1
+        if(ColorIO.a < 1.0 && ColorIO.a > 0.001)
+        {
+            SpecularLight /= max(ColorIO.a, 0.1);
+        }
+        ColorIO.rgb += MATERIAL_SPECULAR_COLOR_VALUE * SpecularLight;
+    #endif
+
+    #if SHADER_DEBUG_MODE > 0
+        #if SHADER_DEBUG_MODE == SHADER_DEBUG_MODE_LIGHT_TOTAL
+            ColorIO.rgb = TotalLight
+                        #if SPECULAR_LIGHT == 1
+                            + MATERIAL_SPECULAR_COLOR_VALUE * SpecularLight
+                        #endif
+                            ;
+        #elif SHADER_DEBUG_MODE == SHADER_DEBUG_MODE_LIGHT_STATIC
+            #if FRAGMENT_LIGHTING == 1
+                ColorIO.rgb = COLOR_BLACK.rgb;
+            #else
+                ColorIO.rgb = 
+                    #if SPECULAR_LIGHT == 1
+                    (1.0 - MATERIAL_SPECULARITY_VALUE) *
+                    #endif
+                    StaticLight * materialFrontDiffuse.rgb;
+            #endif
+        #elif SHADER_DEBUG_MODE == SHADER_DEBUG_MODE_LIGHT_AMBIENT
+            ColorIO.rgb = AmbientLight;
+        #elif SHADER_DEBUG_MODE == SHADER_DEBUG_MODE_LIGHT_DIFFUSE
+            ColorIO.rgb = DiffuseLight;
+        #elif SHADER_DEBUG_MODE == SHADER_DEBUG_MODE_LIGHT_SPECULAR && SPECULAR_LIGHT == 1
+            ColorIO.rgb = MATERIAL_SPECULAR_COLOR_VALUE * SpecularLight;
+        #endif
+    #endif
+}
+
+// Standard fragment shader with custom lighting override
+void ApplyStandardShaderOverride()
+{
+    #if LIGHTING == 1
+        #if FRAGMENT_LIGHTING == 1 || FRAGMENT_NORMAL == 1
+            ComputeLightingOverride(FragmentColor, vFragmentNormal);
+        #else
+            #if SELF_ILLUMINATION_MAP == 1
+                #if MATERIAL_READ_SELF_ILLUMINATION_FROM_SPECULAR_MAP == 1
+                    if(texture2Bound != 0)
+                    {
+                        FragmentColor.rgb *= FragmentColor.rgb * (VertexColor.rgb + texture2D(texUnit2, vTexCoords).b);
+                        FragmentColor.a *= VertexColor.a;
+                    }
+                #else
+                    if(texture5Bound != 0)
+                    {
+                        FragmentColor.rgb *= FragmentColor.rgb * (VertexColor.rgb + texture2D(texUnit5, vTexCoords).r);
+                        FragmentColor.a *= VertexColor.a;
+                    }
+                #endif
+                else
+            #endif
+            {
+                FragmentColor *= VertexColor;
+            }
+        #endif
+    #endif
+    
+    #if POSITION_WORLD == 1 || POSITION_VIEW == 1
+        ApplyTargetGroundHighlighting(FragmentColor);
+    #endif
+    
+    #if KEYHOLING == 1
+        ApplyKeyhole(FragmentColor);
+    #endif
+    
+    FragmentColor.rgb = RevertColorSpace(FragmentColor.rgb);
+
+    #if FOG == 1
+        ApplyFog(FragmentColor);
+    #endif
+    
+    ApplyDebugModeOutput(FragmentColor);
+}
+
+void main ()
+{
+    FragmentColor = vec4(1.0);
+    SetupStandardShaderInputs();
+    ApplyStandardShaderOverride();
+    gl_FragColor = FragmentColor;
+}
